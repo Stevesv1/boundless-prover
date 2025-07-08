@@ -28,41 +28,6 @@ print_info() {
     echo -e "${CYAN}[INFO]${NC} $1"
 }
 
-get_gpu_info() {
-    local gpu_count=0
-    local gpu_info=""
-    
-    if command -v nvidia-smi &> /dev/null; then
-        gpu_count=$(nvidia-smi -L 2>/dev/null | wc -l)
-        if [ $gpu_count -gt 0 ]; then
-            gpu_info=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits)
-        fi
-    fi
-    
-    echo "$gpu_count|$gpu_info"
-}
-
-get_cpu_cores() {
-    nproc
-}
-
-determine_segment_size() {
-    local vram_mb=$1
-    local vram_gb=$((vram_mb / 1024))
-    
-    if [ $vram_gb -ge 40 ]; then
-        echo 22
-    elif [ $vram_gb -ge 20 ]; then
-        echo 21
-    elif [ $vram_gb -ge 16 ]; then
-        echo 20
-    elif [ $vram_gb -ge 8 ]; then
-        echo 19
-    else
-        echo 18
-    fi
-}
-
 update_env_var() {
     local file="$1"
     local var="$2"
@@ -75,90 +40,41 @@ update_env_var() {
     fi
 }
 
-configure_compose_yml() {
-    print_step "Configuring compose.yml for optimal performance..."
+modify_compose_for_multiple_gpus() {
+    local gpu_count="$1"
     
-    local gpu_info=$(get_gpu_info)
-    local gpu_count=$(echo "$gpu_info" | cut -d'|' -f1)
-    local gpu_details=$(echo "$gpu_info" | cut -d'|' -f2)
-    local cpu_cores=$(get_cpu_cores)
-    
-    print_info "System Information:"
-    print_info "CPU Cores: $cpu_cores"
-    print_info "GPU Count: $gpu_count"
-    
-    if [ $gpu_count -gt 0 ]; then
-        echo -e "${CYAN}GPU Details:${NC}"
-        echo "$gpu_details" | while IFS=',' read -r name memory; do
-            name=$(echo "$name" | xargs)
-            memory=$(echo "$memory" | xargs)
-            segment_size=$(determine_segment_size $memory)
-            echo -e "  ${GREEN}$name${NC}: ${YELLOW}${memory}MB${NC} VRAM (Segment Size: $segment_size)"
-        done
-        
-        echo ""
-        echo -e "${PURPLE}GPU Configuration Options:${NC}"
-        if [ $gpu_count -eq 2 ]; then
-            echo "You have 2 GPUs. Options:"
-            echo "1. Run 2 provers on 2 different networks (1 GPU each)"
-            echo "2. Use both GPUs for a single prover on one network"
-        elif [ $gpu_count -eq 3 ]; then
-            echo "You have 3 GPUs. Options:"
-            echo "1. Run 3 provers on 3 different networks (1 GPU each)"
-            echo "2. Use all 3 GPUs for a single prover on one network"
-        elif [ $gpu_count -gt 3 ]; then
-            echo "You have $gpu_count GPUs. Options:"
-            echo "1. Run provers on 3 networks (1 network gets 2 GPUs, others get 1 each)"
-            echo "2. Use all GPUs for a single prover on one network"
-        fi
-        
-        echo ""
-        read -p "Choose configuration (1 or 2): " gpu_config
-        
-        if [ "$gpu_config" = "1" ]; then
-            echo "Selected: Distributed GPU configuration"
-            GPU_DISTRIBUTION="distributed"
-        else
-            echo "Selected: Consolidated GPU configuration"
-            GPU_DISTRIBUTION="consolidated"
-        fi
-    else
-        echo "No GPUs detected. Optimizing for CPU-only configuration."
-        GPU_DISTRIBUTION="cpu_only"
+    if [ $gpu_count -le 1 ]; then
+        print_info "Single GPU detected, no compose.yml modification needed"
+        return 0
     fi
+    
+    print_step "Configuring compose.yml for $gpu_count GPUs..."
     
     cp compose.yml compose.yml.backup
     print_info "Created backup: compose.yml.backup"
     
-    local first_gpu_vram=$(echo "$gpu_details" | head -1 | cut -d',' -f2 | xargs)
-    local segment_size=$(determine_segment_size ${first_gpu_vram:-8192})
+    print_info "Adding GPU agents for GPUs 1-$((gpu_count-1))..."
     
-    if [ $gpu_count -gt 1 ] && [ "$GPU_DISTRIBUTION" = "consolidated" ]; then
-        modify_compose_for_multiple_gpus $gpu_count $segment_size $cpu_cores
-    elif [ $gpu_count -eq 0 ]; then
-        modify_compose_for_cpu_only $cpu_cores $segment_size
-    else
-        modify_compose_for_single_gpu $segment_size $cpu_cores
+    local gpu_agent_end_line
+    gpu_agent_end_line=$(grep -n "capabilities: \[gpu\]" compose.yml | head -1 | cut -d: -f1)
+    
+    if [[ -z "$gpu_agent_end_line" ]]; then
+        print_error "Could not find gpu_prove_agent0 section end marker"
+        return 1
     fi
     
-    print_success "Compose.yml configured successfully"
-}
-
-modify_compose_for_multiple_gpus() {
-    local gpu_count="$1"
-    local segment_size="$2"
-    local cpu_cores="$3"
+    print_info "Found gpu_prove_agent0 end at line $gpu_agent_end_line"
     
-    print_info "Configuring for $gpu_count GPUs with segment size $segment_size..."
-    
-    local gpu_agents=""
+    local additional_agents=""
     for ((i=1; i<gpu_count; i++)); do
-        gpu_agents+="
+        additional_agents+="
   gpu_prove_agent$i:
     <<: *agent-common
+    runtime: nvidia
     mem_limit: 4G
     cpus: 4
     entrypoint: /app/agent -t prove
+
     deploy:
       resources:
         reservations:
@@ -169,7 +85,52 @@ modify_compose_for_multiple_gpus() {
 "
     done
     
-    sed -i "/gpu_prove_agent0:/a\\$gpu_agents" compose.yml
+    {
+        head -n "$gpu_agent_end_line" compose.yml
+        echo "$additional_agents"
+        tail -n +$((gpu_agent_end_line + 1)) compose.yml
+    } > compose.yml.tmp && mv compose.yml.tmp compose.yml
+    
+    print_success "Added GPU agents for GPUs 1-$((gpu_count-1))"
+    
+    print_info "Updating broker dependencies..."
+    
+    local broker_start_line
+    local depends_on_line
+    local depends_on_end_line
+    
+    broker_start_line=$(grep -n "^[[:space:]]*broker:" compose.yml | cut -d: -f1)
+    if [[ -z "$broker_start_line" ]]; then
+        print_error "Could not find broker section"
+        return 1
+    fi
+    
+    depends_on_line=$(tail -n +$broker_start_line compose.yml | grep -n "^[[:space:]]*depends_on:" | head -1 | cut -d: -f1)
+    if [[ -z "$depends_on_line" ]]; then
+        print_error "Could not find broker depends_on section"
+        return 1
+    fi
+    
+    depends_on_line=$((broker_start_line + depends_on_line - 1))
+    print_info "Found broker depends_on at line $depends_on_line"
+    
+    depends_on_end_line=$depends_on_line
+    while read -r line; do
+        ((depends_on_end_line++))
+        if [[ "$line" =~ ^[[:space:]]*-[[:space:]] ]]; then
+            continue
+        elif [[ -z "$line" ]] || [[ "$line" =~ ^[[:space:]]*# ]]; then
+            continue
+        elif [[ "$line" =~ ^[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*:[[:space:]]* ]]; then
+            ((depends_on_end_line--))
+            break
+        elif [[ "$line" =~ ^[a-zA-Z_][a-zA-Z0-9_]*:[[:space:]]* ]]; then
+            ((depends_on_end_line--))
+            break
+        fi
+    done < <(tail -n +$((depends_on_line + 1)) compose.yml)
+    
+    print_info "Dependencies section ends at line $depends_on_end_line"
     
     local new_dependencies="    depends_on:
       - rest_api"
@@ -187,53 +148,39 @@ modify_compose_for_multiple_gpus() {
       - redis
       - postgres"
     
-    sed -i '/broker:/,/depends_on:/d' compose.yml
-    sed -i '/broker:/a\\'"$new_dependencies" compose.yml
+    {
+        head -n $((depends_on_line - 1)) compose.yml
+        echo "$new_dependencies"
+        tail -n +$((depends_on_end_line + 1)) compose.yml
+    } > compose.yml.tmp && mv compose.yml.tmp compose.yml
     
-    sed -i "s/SEGMENT_SIZE:-21/SEGMENT_SIZE:-$segment_size/g" compose.yml
+    print_success "Updated broker dependencies to include all $gpu_count GPU agents"
     
-    local optimal_cpus=$((cpu_cores / 4))
-    if [ $optimal_cpus -lt 2 ]; then
-        optimal_cpus=2
+    print_info "Verifying compose.yml modifications..."
+    local gpu_agents_count
+    gpu_agents_count=$(grep -c "gpu_prove_agent[0-9]*:" compose.yml || true)
+    
+    if [[ "$gpu_agents_count" -eq "$gpu_count" ]]; then
+        print_success "✓ Found $gpu_agents_count GPU agents in compose.yml"
+    else
+        print_warning "⚠ Expected $gpu_count GPU agents, found $gpu_agents_count"
     fi
     
-    sed -i "s/cpus: 4/cpus: $optimal_cpus/g" compose.yml
-}
-
-modify_compose_for_cpu_only() {
-    local cpu_cores="$1"
-    local segment_size="$2"
+    local missing_deps=()
+    for ((i=0; i<gpu_count; i++)); do
+        if ! grep -A 20 "broker:" compose.yml | grep -q "gpu_prove_agent$i"; then
+            missing_deps+=("gpu_prove_agent$i")
+        fi
+    done
     
-    print_info "Configuring for CPU-only mode with $cpu_cores cores..."
-    
-    sed -i '/runtime: nvidia/d' compose.yml
-    sed -i '/deploy:/,/capabilities: \[gpu\]/d' compose.yml
-    
-    local cpu_per_exec=$((cpu_cores / 3))
-    if [ $cpu_per_exec -lt 2 ]; then
-        cpu_per_exec=2
+    if [[ ${#missing_deps[@]} -eq 0 ]]; then
+        print_success "✓ All GPU agents are included in broker dependencies"
+    else
+        print_warning "⚠ Missing GPU agents in broker dependencies: ${missing_deps[*]}"
     fi
     
-    sed -i "s/cpus: 3/cpus: $cpu_per_exec/g" compose.yml
-    sed -i "s/cpus: 4/cpus: $cpu_per_exec/g" compose.yml
-    
-    sed -i "s/SEGMENT_SIZE:-21/SEGMENT_SIZE:-$segment_size/g" compose.yml
-}
-
-modify_compose_for_single_gpu() {
-    local segment_size="$1"
-    local cpu_cores="$2"
-    
-    print_info "Configuring for single GPU with segment size $segment_size..."
-    
-    sed -i "s/SEGMENT_SIZE:-21/SEGMENT_SIZE:-$segment_size/g" compose.yml
-    
-    local optimal_cpus=$((cpu_cores / 4))
-    if [ $optimal_cpus -lt 2 ]; then
-        optimal_cpus=2
-    fi
-    
-    sed -i "s/cpus: 4/cpus: $optimal_cpus/g" compose.yml
+    print_success "Multi-GPU configuration completed successfully"
+    print_info "Configured for $gpu_count GPUs: gpu_prove_agent0 through gpu_prove_agent$((gpu_count-1))"
 }
 
 source_rust_env() {
@@ -241,269 +188,303 @@ source_rust_env() {
     
     if [[ -f "$HOME/.cargo/env" ]]; then
         source "$HOME/.cargo/env"
+        print_info "Sourced Rust environment from $HOME/.cargo/env"
     fi
     
     if [[ -n "${SUDO_USER:-}" ]] && [[ "$SUDO_USER" != "root" ]]; then
         local user_home="/home/$SUDO_USER"
         if [[ -f "$user_home/.cargo/env" ]]; then
             source "$user_home/.cargo/env"
+            print_info "Sourced Rust environment from $user_home/.cargo/env"
         fi
     fi
     
     if [[ -d "$HOME/.cargo/bin" ]]; then
         export PATH="$HOME/.cargo/bin:$PATH"
+        print_info "Added $HOME/.cargo/bin to PATH"
+    fi
+    
+    if [[ -n "${SUDO_USER:-}" ]] && [[ "$SUDO_USER" != "root" ]]; then
+        local user_home="/home/$SUDO_USER"
+        if [[ -d "$user_home/.cargo/bin" ]]; then
+            export PATH="$user_home/.cargo/bin:$PATH"
+            print_info "Added $user_home/.cargo/bin to PATH"
+        fi
     fi
     
     if command -v rustc &> /dev/null && command -v cargo &> /dev/null; then
         print_success "Rust environment successfully loaded"
+        print_info "Rust version: $(rustc --version)"
+        print_info "Cargo version: $(cargo --version)"
     else
         print_error "Failed to load Rust environment"
         return 1
     fi
 }
 
-clone_and_install() {
-    print_step "Updating system and installing dependencies..."
-    sudo apt update && sudo apt install -y sudo git curl build-essential
+print_step "Updating system and installing dependencies..."
+sudo apt update && sudo apt install -y sudo git curl
+print_success "Dependencies installed"
+
+print_step "Cloning Boundless repository..."
+git clone https://github.com/boundless-xyz/boundless
+cd boundless
+git checkout release-0.12
+print_success "Repository cloned and checked out to release-0.10"
+
+print_step "Replacing setup script..."
+rm scripts/setup.sh
+curl -o scripts/setup.sh https://raw.githubusercontent.com/Stevesv1/boundless-prover/refs/heads/main/script.sh
+chmod +x scripts/setup.sh
+print_success "Setup script replaced"
+
+print_step "Running setup script..."
+sudo ./scripts/setup.sh
+print_success "Setup script executed"
+
+print_step "Loading Rust environment..."
+source_rust_env
+
+print_step "Installing Risc Zero..."
+
+curl -L https://risczero.com/install | bash
+
+export PATH="/root/.risc0/bin:$PATH"
+print_info "Added /root/.risc0/bin to PATH"
+
+if [[ -d "$HOME/.rzup/bin" ]]; then
+    export PATH="$HOME/.rzup/bin:$PATH"
+    print_info "Added $HOME/.rzup/bin to PATH"
+fi
+
+source "$HOME/.bashrc"
+
+if [[ -f "$HOME/.rzup/env" ]]; then
+    source "$HOME/.rzup/env"
+    print_info "Sourced rzup environment from $HOME/.rzup/env"
+fi
+
+if [[ -f "/root/.risc0/env" ]]; then
+    source "/root/.risc0/env"
+    print_info "Sourced rzup environment from /root/.risc0/env"
+fi
+
+if command -v rzup &> /dev/null; then
+    print_info "rzup found, installing Rust toolchain..."
+    rzup install rust
+    print_info "Updating r0vm..."
+    rzup update r0vm
+    print_success "Risc Zero installed successfully"
+else
+    print_error "rzup still not found. Checking available paths..."
+    print_info "Current PATH: $PATH"
+    print_info "Contents of /root/.risc0/bin:"
+    ls -la /root/.risc0/bin/ 2>/dev/null || print_info "Directory not found"
     
-    print_step "Cloning Boundless repository..."
-    if [ -d "boundless" ]; then
-        rm -rf boundless
-    fi
-    git clone https://github.com/boundless-xyz/boundless
-    cd boundless
-    git checkout release-0.12
-    
-    print_step "Replacing setup script..."
-    rm -f scripts/setup.sh
-    curl -o scripts/setup.sh https://raw.githubusercontent.com/Stevesv1/boundless-prover/refs/heads/main/script.sh
-    chmod +x scripts/setup.sh
-    
-    print_step "Running setup script..."
-    sudo ./scripts/setup.sh
-    
-    print_step "Loading Rust environment..."
-    source_rust_env
-    
-    print_step "Installing Risc Zero..."
-    curl -L https://risczero.com/install | bash
-    
-    export PATH="/root/.risc0/bin:$PATH"
-    
-    if [[ -d "$HOME/.rzup/bin" ]]; then
-        export PATH="$HOME/.rzup/bin:$PATH"
-    fi
-    
-    source "$HOME/.bashrc" 2>/dev/null || true
-    
-    if [[ -f "$HOME/.rzup/env" ]]; then
-        source "$HOME/.rzup/env"
-    fi
-    
-    if [[ -f "/root/.risc0/env" ]]; then
-        source "/root/.risc0/env"
-    fi
-    
-    if command -v rzup &> /dev/null; then
-        rzup install rust
-        rzup update r0vm
-    elif [[ -x "/root/.risc0/bin/rzup" ]]; then
+    if [[ -x "/root/.risc0/bin/rzup" ]]; then
+        print_info "Found rzup binary, executing directly..."
         /root/.risc0/bin/rzup install rust
         /root/.risc0/bin/rzup update r0vm
-    fi
-    
-    source_rust_env
-    
-    print_step "Installing additional tools..."
-    if command -v cargo &> /dev/null; then
-        cargo install --git https://github.com/risc0/risc0 bento-client --bin bento_cli
-        
-        if command -v just &> /dev/null; then
-            just bento
-        fi
-        
-        cargo install --locked boundless-cli
-    fi
-    
-    print_success "All packages installed successfully"
-}
-
-configure_networks() {
-    print_step "Network Configuration"
-    
-    echo -e "${PURPLE}Choose networks to run the prover on:${NC}"
-    echo "1. Base Mainnet"
-    echo "2. Base Sepolia"
-    echo "3. Ethereum Sepolia"
-    echo ""
-    read -p "Enter your choices (e.g., 1,2,3 for all): " network_choice
-    
-    read -p "Enter your private key: " private_key
-    
-    if [[ $network_choice == *"1"* ]]; then
-        read -p "Enter Base Mainnet RPC URL: " base_rpc
-        
-        cp .env.broker-template .env.broker.base
-        update_env_var ".env.broker.base" "PRIVATE_KEY" "$private_key"
-        update_env_var ".env.broker.base" "BOUNDLESS_MARKET_ADDRESS" "0x26759dbB201aFbA361Bec78E097Aa3942B0b4AB8"
-        update_env_var ".env.broker.base" "SET_VERIFIER_ADDRESS" "0x8C5a8b5cC272Fe2b74D18843CF9C3aCBc952a760"
-        update_env_var ".env.broker.base" "RPC_URL" "$base_rpc"
-        update_env_var ".env.broker.base" "ORDER_STREAM_URL" "https://base-mainnet.beboundless.xyz"
-        
-        echo "export PRIVATE_KEY=\"$private_key\"" > .env.base
-        echo "export RPC_URL=\"$base_rpc\"" >> .env.base
-        
-        print_success "Base Mainnet environment configured"
-    fi
-    
-    if [[ $network_choice == *"2"* ]]; then
-        read -p "Enter Base Sepolia RPC URL: " base_sepolia_rpc
-        
-        cp .env.broker-template .env.broker.base-sepolia
-        update_env_var ".env.broker.base-sepolia" "PRIVATE_KEY" "$private_key"
-        update_env_var ".env.broker.base-sepolia" "BOUNDLESS_MARKET_ADDRESS" "0x6B7ABa661041164b8dB98E30AE1454d2e9D5f14b"
-        update_env_var ".env.broker.base-sepolia" "SET_VERIFIER_ADDRESS" "0x8C5a8b5cC272Fe2b74D18843CF9C3aCBc952a760"
-        update_env_var ".env.broker.base-sepolia" "RPC_URL" "$base_sepolia_rpc"
-        update_env_var ".env.broker.base-sepolia" "ORDER_STREAM_URL" "https://base-sepolia.beboundless.xyz"
-        
-        echo "export PRIVATE_KEY=\"$private_key\"" > .env.base-sepolia
-        echo "export RPC_URL=\"$base_sepolia_rpc\"" >> .env.base-sepolia
-        
-        print_success "Base Sepolia environment configured"
-    fi
-    
-    if [[ $network_choice == *"3"* ]]; then
-        read -p "Enter Ethereum Sepolia RPC URL: " eth_sepolia_rpc
-        
-        cp .env.broker-template .env.broker.eth-sepolia
-        update_env_var ".env.broker.eth-sepolia" "PRIVATE_KEY" "$private_key"
-        update_env_var ".env.broker.eth-sepolia" "BOUNDLESS_MARKET_ADDRESS" "0x13337C76fE2d1750246B68781ecEe164643b98Ec"
-        update_env_var ".env.broker.eth-sepolia" "SET_VERIFIER_ADDRESS" "0x7aAB646f23D1392d4522CFaB0b7FB5eaf6821d64"
-        update_env_var ".env.broker.eth-sepolia" "RPC_URL" "$eth_sepolia_rpc"
-        update_env_var ".env.broker.eth-sepolia" "ORDER_STREAM_URL" "https://eth-sepolia.beboundless.xyz/"
-        
-        echo "export PRIVATE_KEY=\"$private_key\"" > .env.eth-sepolia
-        echo "export RPC_URL=\"$eth_sepolia_rpc\"" >> .env.eth-sepolia
-        
-        print_success "Ethereum Sepolia environment configured"
-    fi
-    
-    configure_broker_settings
-    
-    export NETWORK_CHOICE="$network_choice"
-    export PRIVATE_KEY="$private_key"
-    export BASE_RPC="$base_rpc"
-    export BASE_SEPOLIA_RPC="$base_sepolia_rpc"
-    export ETH_SEPOLIA_RPC="$eth_sepolia_rpc"
-}
-
-configure_broker_settings() {
-    print_step "Configuring broker settings..."
-    
-    local gpu_info=$(get_gpu_info)
-    local gpu_count=$(echo "$gpu_info" | cut -d'|' -f1)
-    
-    cp broker-template.toml broker.toml
-    
-    if [ $gpu_count -eq 0 ]; then
-        max_proofs=1
-        peak_khz=50
-    elif [ $gpu_count -eq 1 ]; then
-        max_proofs=2
-        peak_khz=100
-    elif [ $gpu_count -eq 2 ]; then
-        max_proofs=4
-        peak_khz=200
-    elif [ $gpu_count -eq 3 ]; then
-        max_proofs=6
-        peak_khz=300
+        print_success "Risc Zero installed successfully using direct path"
     else
-        max_proofs=$((gpu_count * 2))
-        peak_khz=$((gpu_count * 100))
+        print_error "rzup binary not found or not executable"
     fi
-    
-    sed -i "s/max_concurrent_proofs = .*/max_concurrent_proofs = $max_proofs/" broker.toml
-    sed -i "s/peak_prove_khz = .*/peak_prove_khz = $peak_khz/" broker.toml
-    
-    print_success "Broker settings configured for $gpu_count GPU(s)"
-}
+fi
 
-deposit_stake() {
-    print_step "Depositing stake for selected networks..."
-    
-    if [ -z "$NETWORK_CHOICE" ]; then
-        print_error "Network not configured. Please configure networks first."
-        return 1
-    fi
-    
-    if [[ $NETWORK_CHOICE == *"1"* ]]; then
-        print_info "Depositing stake on Base Mainnet..."
-        boundless \
-            --rpc-url "$BASE_RPC" \
-            --private-key "$PRIVATE_KEY" \
-            --chain-id 8453 \
-            --boundless-market-address 0x26759dbB201aFbA361Bec78E097Aa3942B0b4AB8 \
-            --set-verifier-address 0x8C5a8b5cC272Fe2b74D18843CF9C3aCBc952a760 \
-            account deposit-stake 10
-        print_success "Base Mainnet stake deposited"
-    fi
-    
-    if [[ $NETWORK_CHOICE == *"2"* ]]; then
-        print_info "Depositing stake on Base Sepolia..."
-        boundless \
-            --rpc-url "$BASE_SEPOLIA_RPC" \
-            --private-key "$PRIVATE_KEY" \
-            --chain-id 84532 \
-            --boundless-market-address 0x6B7ABa661041164b8dB98E30AE1454d2e9D5f14b \
-            --set-verifier-address 0x8C5a8b5cC272Fe2b74D18843CF9C3aCBc952a760 \
-            account deposit-stake 10
-        print_success "Base Sepolia stake deposited"
-    fi
-    
-    if [[ $NETWORK_CHOICE == *"3"* ]]; then
-        print_info "Depositing stake on Ethereum Sepolia..."
-        boundless \
-            --rpc-url "$ETH_SEPOLIA_RPC" \
-            --private-key "$PRIVATE_KEY" \
-            --chain-id 11155111 \
-            --boundless-market-address 0x13337C76fE2d1750246B68781ecEe164643b98Ec \
-            --set-verifier-address 0x7aAB646f23D1392d4522CFaB0b7FB5eaf6821d64 \
-            account deposit-stake 10
-        print_success "Ethereum Sepolia stake deposited"
-    fi
-    
-    print_success "Stake deposits completed"
-}
+source_rust_env
 
-run_broker() {
-    print_step "Starting brokers..."
-    
-    if [ -z "$NETWORK_CHOICE" ]; then
-        print_error "Network not configured. Please configure networks first."
-        return 1
-    fi
-    
-    if [[ $NETWORK_CHOICE == *"1"* ]]; then
-        print_info "Starting Base Mainnet broker..."
-        just broker up ./.env.broker.base &
-    fi
-    
-    if [[ $NETWORK_CHOICE == *"2"* ]]; then
-        print_info "Starting Base Sepolia broker..."
-        just broker up ./.env.broker.base-sepolia &
-    fi
-    
-    if [[ $NETWORK_CHOICE == *"3"* ]]; then
-        print_info "Starting Ethereum Sepolia broker..."
-        just broker up ./.env.broker.eth-sepolia &
-    fi
-    
-    print_success "Brokers started successfully"
-}
+print_step "Installing additional tools..."
 
-setup_environment() {
-    print_step "Setting up environment for future sessions..."
+if ! command -v cargo &> /dev/null; then
+    print_error "Cargo not found. Re-attempting to source Rust environment..."
+    source_rust_env
+fi
+
+if command -v cargo &> /dev/null; then
+    print_info "Installing bento-client..."
+    cargo install --git https://github.com/risc0/risc0 bento-client --bin bento_cli
     
+    print_info "Running just bento..."
+    if command -v just &> /dev/null; then
+        just bento
+    else
+        print_warning "just command not found, skipping 'just bento'"
+    fi
+    
+    print_info "Installing boundless-cli..."
+    cargo install --locked boundless-cli
+    
+    print_success "Additional tools installed"
+else
+    print_error "Cargo still not available. Please check Rust installation."
+    exit 1
+fi
+
+print_step "Checking GPU configuration..."
+gpu_count=0
+if command -v nvidia-smi &> /dev/null; then
+    gpu_count=$(nvidia-smi -L 2>/dev/null | wc -l)
+fi
+print_info "Found $gpu_count GPU(s)"
+
+modify_compose_for_multiple_gpus $gpu_count
+
+print_step "Network Selection"
+echo -e "${PURPLE}Choose networks to run the prover on:${NC}"
+echo "1. Base Mainnet"
+echo "2. Base Sepolia"
+echo "3. Ethereum Sepolia"
+echo ""
+read -p "Enter your choices (e.g., 1,2,3 for all): " network_choice
+
+if [[ $network_choice == *"1"* ]]; then
+    cp .env.broker-template .env.broker.base
+    cp .env.base .env.base.backup
+    print_info "Created Base Mainnet environment files"
+fi
+
+if [[ $network_choice == *"2"* ]]; then
+    cp .env.broker-template .env.broker.base-sepolia
+    cp .env.base-sepolia .env.base-sepolia.backup
+    print_info "Created Base Sepolia environment files"
+fi
+
+if [[ $network_choice == *"3"* ]]; then
+    cp .env.broker-template .env.broker.eth-sepolia
+    cp .env.eth-sepolia .env.eth-sepolia.backup
+    print_info "Created Ethereum Sepolia environment files"
+fi
+
+read -p "Enter your private key: " private_key
+
+if [[ $network_choice == *"1"* ]]; then
+    read -p "Enter Base Mainnet RPC URL: " base_rpc
+    
+    update_env_var ".env.broker.base" "PRIVATE_KEY" "$private_key"
+    update_env_var ".env.broker.base" "BOUNDLESS_MARKET_ADDRESS" "0x26759dbB201aFbA361Bec78E097Aa3942B0b4AB8"
+    update_env_var ".env.broker.base" "SET_VERIFIER_ADDRESS" "0x8C5a8b5cC272Fe2b74D18843CF9C3aCBc952a760"
+    update_env_var ".env.broker.base" "RPC_URL" "$base_rpc"
+    update_env_var ".env.broker.base" "ORDER_STREAM_URL" "https://base-mainnet.beboundless.xyz"
+    
+    echo "export PRIVATE_KEY=\"$private_key\"" >> .env.base
+    echo "export RPC_URL=\"$base_rpc\"" >> .env.base
+    
+    print_success "Base Mainnet environment configured"
+fi
+
+if [[ $network_choice == *"2"* ]]; then
+    read -p "Enter Base Sepolia RPC URL: " base_sepolia_rpc
+    
+    update_env_var ".env.broker.base-sepolia" "PRIVATE_KEY" "$private_key"
+    update_env_var ".env.broker.base-sepolia" "BOUNDLESS_MARKET_ADDRESS" "0x6B7ABa661041164b8dB98E30AE1454d2e9D5f14b"
+    update_env_var ".env.broker.base-sepolia" "SET_VERIFIER_ADDRESS" "0x8C5a8b5cC272Fe2b74D18843CF9C3aCBc952a760"
+    update_env_var ".env.broker.base-sepolia" "RPC_URL" "$base_sepolia_rpc"
+    update_env_var ".env.broker.base-sepolia" "ORDER_STREAM_URL" "https://base-sepolia.beboundless.xyz"
+    
+    echo "export PRIVATE_KEY=\"$private_key\"" >> .env.base-sepolia
+    echo "export RPC_URL=\"$base_sepolia_rpc\"" >> .env.base-sepolia
+    
+    print_success "Base Sepolia environment configured"
+fi
+
+if [[ $network_choice == *"3"* ]]; then
+    read -p "Enter Ethereum Sepolia RPC URL: " eth_sepolia_rpc
+    
+    update_env_var ".env.broker.eth-sepolia" "PRIVATE_KEY" "$private_key"
+    update_env_var ".env.broker.eth-sepolia" "BOUNDLESS_MARKET_ADDRESS" "0x13337C76fE2d1750246B68781ecEe164643b98Ec"
+    update_env_var ".env.broker.eth-sepolia" "SET_VERIFIER_ADDRESS" "0x7aAB646f23D1392d4522CFaB0b7FB5eaf6821d64"
+    update_env_var ".env.broker.eth-sepolia" "RPC_URL" "$eth_sepolia_rpc"
+    update_env_var ".env.broker.eth-sepolia" "ORDER_STREAM_URL" "https://eth-sepolia.beboundless.xyz/"
+    
+    echo "export PRIVATE_KEY=\"$private_key\"" >> .env.eth-sepolia
+    echo "export RPC_URL=\"$eth_sepolia_rpc\"" >> .env.eth-sepolia
+    
+    print_success "Ethereum Sepolia environment configured"
+fi
+
+print_step "Configuring broker settings..."
+cp broker-template.toml broker.toml
+
+if [ $gpu_count -eq 1 ]; then
+    max_proofs=2
+    peak_khz=100
+elif [ $gpu_count -eq 2 ]; then
+    max_proofs=4
+    peak_khz=200
+elif [ $gpu_count -eq 3 ]; then
+    max_proofs=6
+    peak_khz=300
+else
+    max_proofs=$((gpu_count * 2))
+    peak_khz=$((gpu_count * 100))
+fi
+
+sed -i "s/max_concurrent_proofs = .*/max_concurrent_proofs = $max_proofs/" broker.toml
+sed -i "s/peak_prove_khz = .*/peak_prove_khz = $peak_khz/" broker.toml
+
+print_success "Broker settings configured for $gpu_count GPU(s)"
+
+print_step "Depositing stake for selected networks..."
+
+if [[ $network_choice == *"1"* ]]; then
+    print_info "Depositing stake on Base Mainnet..."
+    boundless \
+        --rpc-url $base_rpc \
+        --private-key $private_key \
+        --chain-id 8453 \
+        --boundless-market-address 0x26759dbB201aFbA361Bec78E097Aa3942B0b4AB8 \
+        --set-verifier-address 0x8C5a8b5cC272Fe2b74D18843CF9C3aCBc952a760 \
+        account deposit-stake 10
+    print_success "Base Mainnet stake deposited"
+fi
+
+if [[ $network_choice == *"2"* ]]; then
+    print_info "Depositing stake on Base Sepolia..."
+    boundless \
+        --rpc-url $base_sepolia_rpc \
+        --private-key $private_key \
+        --chain-id 84532 \
+        --boundless-market-address 0x6B7ABa661041164b8dB98E30AE1454d2e9D5f14b \
+        --set-verifier-address 0x8C5a8b5cC272Fe2b74D18843CF9C3aCBc952a760 \
+        account deposit-stake 10
+    print_success "Base Sepolia stake deposited"
+fi
+
+if [[ $network_choice == *"3"* ]]; then
+    print_info "Depositing stake on Ethereum Sepolia..."
+    boundless \
+        --rpc-url $eth_sepolia_rpc \
+        --private-key $private_key \
+        --chain-id 11155111 \
+        --boundless-market-address 0x13337C76fE2d1750246B68781ecEe164643b98Ec \
+        --set-verifier-address 0x7aAB646f23D1392d4522CFaB0b7FB5eaf6821d64 \
+        account deposit-stake 10
+    print_success "Ethereum Sepolia stake deposited"
+fi
+
+print_success "Stake deposits completed for all selected networks"
+
+print_step "Setting up environment for future sessions..."
+
+{
+    echo ""
+    echo "# Rust environment"
+    echo "if [ -f \"\$HOME/.cargo/env\" ]; then"
+    echo "    source \"\$HOME/.cargo/env\""
+    echo "fi"
+    echo ""
+    echo "# RISC Zero environment"
+    echo "export PATH=\"/root/.risc0/bin:\$PATH\""
+    echo "if [ -f \"\$HOME/.rzup/env\" ]; then"
+    echo "    source \"\$HOME/.rzup/env\""
+    echo "fi"
+    echo "if [ -f \"/root/.risc0/env\" ]; then"
+    echo "    source \"/root/.risc0/env\""
+    echo "fi"
+} >> ~/.bashrc
+
+if [[ -n "${SUDO_USER:-}" ]] && [[ "$SUDO_USER" != "root" ]]; then
+    user_home="/home/$SUDO_USER"
     {
         echo ""
         echo "# Rust environment"
@@ -517,163 +498,28 @@ setup_environment() {
         echo "    source \"\$HOME/.rzup/env\""
         echo "fi"
         echo "if [ -f \"/root/.risc0/env\" ]; then"
-        echo "    source \"/root/.risc0/env\""
+            echo "    source \"/root/.risc0/env\""
         echo "fi"
-    } >> ~/.bashrc
-    
-    if [[ -n "${SUDO_USER:-}" ]] && [[ "$SUDO_USER" != "root" ]]; then
-        user_home="/home/$SUDO_USER"
-        {
-            echo ""
-            echo "# Rust environment"
-            echo "if [ -f \"\$HOME/.cargo/env\" ]; then"
-            echo "    source \"\$HOME/.cargo/env\""
-            echo "fi"
-            echo ""
-            echo "# RISC Zero environment"
-            echo "export PATH=\"/root/.risc0/bin:\$PATH\""
-            echo "if [ -f \"\$HOME/.rzup/env\" ]; then"
-            echo "    source \"\$HOME/.rzup/env\""
-            echo "fi"
-            echo "if [ -f \"/root/.risc0/env\" ]; then"
-                echo "    source \"/root/.risc0/env\""
-            echo "fi"
-        } | sudo -u "$SUDO_USER" tee -a "$user_home/.bashrc" > /dev/null
-    fi
-    
-    print_success "Environment configured for future sessions"
-}
-
-full_installation() {
-    print_step "Starting full installation..."
-    
-    clone_and_install
-    configure_compose_yml
-    configure_networks
-    deposit_stake
-    setup_environment
-    run_broker
-    
-    print_success "Full installation completed successfully!"
-}
-
-show_menu() {
-    clear
-    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║                    BOUNDLESS PROVER SETUP                   ║${NC}"
-    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    
-    local gpu_info=$(get_gpu_info)
-    local gpu_count=$(echo "$gpu_info" | cut -d'|' -f1)
-    local cpu_cores=$(get_cpu_cores)
-    
-    echo -e "${CYAN}System Information:${NC}"
-    echo -e "CPU Cores: ${YELLOW}$cpu_cores${NC}"
-    echo -e "GPU Count: ${YELLOW}$gpu_count${NC}"
-    
-    if [ $gpu_count -gt 0 ]; then
-        echo -e "${CYAN}GPU Details:${NC}"
-        echo "$(echo "$gpu_info" | cut -d'|' -f2)" | while IFS=',' read -r name memory; do
-            name=$(echo "$name" | xargs)
-            memory=$(echo "$memory" | xargs)
-            echo -e "  ${GREEN}$name${NC}: ${YELLOW}${memory}MB${NC} VRAM"
-        done
-    fi
-    
-    echo ""
-    echo -e "${PURPLE}Menu Options:${NC}"
-    
-    local options=(
-        "Full Installation (Recommended)"
-        "Clone and Install Packages"
-        "Configure Compose.yml"
-        "Configure Networks"
-        "Deposit Stake"
-        "Run Broker"
-        "Setup Environment"
-        "Exit"
-    )
-    
-    local selected=0
-    local menu_size=${#options[@]}
-    
-    while true; do
-        for i in "${!options[@]}"; do
-            if [ $i -eq $selected ]; then
-                echo -e "${GREEN}► ${options[$i]}${NC}"
-            else
-                echo -e "  ${options[$i]}"
-            fi
-        done
-        
-        read -rsn1 key
-        case $key in
-            $'\x1b')
-                read -rsn2 key
-                case $key in
-                    '[A') ((selected--)); [ $selected -lt 0 ] && selected=$((menu_size-1)) ;;
-                    '[B') ((selected++)); [ $selected -ge $menu_size ] && selected=0 ;;
-                esac
-                ;;
-            '')
-                case $selected in
-                    0) full_installation ;;
-                    1) clone_and_install ;;
-                    2) configure_compose_yml ;;
-                    3) configure_networks ;;
-                    4) deposit_stake ;;
-                    5) run_broker ;;
-                    6) setup_environment ;;
-                    7) exit 0 ;;
-                esac
-                echo ""
-                read -p "Press Enter to continue..."
-                ;;
-        esac
-        
-        clear
-        echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║                    BOUNDLESS PROVER SETUP                   ║${NC}"
-        echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
-        echo ""
-        echo -e "${CYAN}System Information:${NC}"
-        echo -e "CPU Cores: ${YELLOW}$cpu_cores${NC}"
-        echo -e "GPU Count: ${YELLOW}$gpu_count${NC}"
-        
-        if [ $gpu_count -gt 0 ]; then
-            echo -e "${CYAN}GPU Details:${NC}"
-            echo "$(echo "$gpu_info" | cut -d'|' -f2)" | while IFS=',' read -r name memory; do
-                name=$(echo "$name" | xargs)
-                memory=$(echo "$memory" | xargs)
-                echo -e "  ${GREEN}$name${NC}: ${YELLOW}${memory}MB${NC} VRAM"
-            done
-        fi
-        
-        echo ""
-        echo -e "${PURPLE}Menu Options:${NC}"
-    done
-}
-
-if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
-    echo "Boundless Prover Setup Script"
-    echo "Usage: $0 [option]"
-    echo ""
-    echo "Options:"
-    echo "  --help, -h        Show this help message"
-    echo "  --full            Run full installation"
-    echo "  --menu            Show interactive menu (default)"
-    echo ""
-    echo "Interactive menu allows you to:"
-    echo "- Configure system based on GPU/CPU specifications"
-    echo "- Install all required packages"
-    echo "- Set up networks and deposit stakes"
-    echo "- Run brokers"
-    exit 0
+    } | sudo -u "$SUDO_USER" tee -a "$user_home/.bashrc" > /dev/null
 fi
 
-if [ "$1" = "--full" ]; then
-    full_installation
-else
-    show_menu
+print_success "Environment configured for future sessions"
+
+print_step "Starting brokers..."
+
+if [[ $network_choice == *"1"* ]]; then
+    print_info "Starting Base Mainnet broker..."
+    just broker up ./.env.broker.base
 fi
+
+if [[ $network_choice == *"2"* ]]; then
+    print_info "Starting Base Sepolia broker..."
+    just broker up ./.env.broker.base-sepolia
+fi
+
+if [[ $network_choice == *"3"* ]]; then
+    print_info "Starting Ethereum Sepolia broker..."
+    just broker up ./.env.broker.eth-sepolia
+fi
+
+print_success "Setup completed successfully!"

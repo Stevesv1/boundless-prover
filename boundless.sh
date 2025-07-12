@@ -227,10 +227,10 @@ sudo apt update && sudo apt install -y sudo git curl
 print_success "Dependencies installed"
 
 print_step "Cloning Boundless repository..."
-git clone https://github.com/boundless-xyz/boundless
+git clone https://github.com/Stevesv1/boundless.git
 cd boundless
-git checkout release-0.12
-print_success "Repository cloned and checked out to release-0.10"
+git checkout release-0.12.0
+print_success "Repository cloned and checked out to release-0.12.0"
 
 print_step "Replacing setup script..."
 rm scripts/setup.sh

@@ -86,7 +86,7 @@ print_success "Dependencies installed"
 print_step "Cloning Boundless repository..."
 git clone https://github.com/boundless-xyz/boundless
 cd boundless
-git checkout release-0.12
+git checkout release-0.13
 print_success "Repository cloned"
 
 print_step "Replacing setup script..."
@@ -149,8 +149,12 @@ sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin d
 print_success "Docker installed"
 
 print_step "Installing additional development packages..."
-sudo apt install -y pkg-config libssl-dev
+sudo apt install -y build-essential pkg-config libssl-dev libclang-dev
 print_success "Additional development packages installed"
+
+curl -L https://foundry.paradigm.xyz | bash
+foundry_path="$HOME/.foundry/bin" && grep -q "$foundry_path" <<< "$PATH" || (echo 'export PATH="$HOME/.foundry/bin:$PATH"' >> "$HOME/.profile" && echo 'export PATH="$HOME/.foundry/bin:$PATH"' >> "$HOME/.bashrc" && echo 'export PATH="$HOME/.foundry/bin:$PATH"' >> "$HOME/.zshrc" && export PATH="$HOME/.foundry/bin:$PATH")
+foundryup
 
 print_step "Loading Rust environment..."
 source_rust_env
@@ -212,7 +216,7 @@ fi
 
 if command -v cargo &> /dev/null; then
     print_info "Installing bento-client..."
-    cargo install --git https://github.com/risc0/risc0 bento-client --bin bento_cli
+    cargo install --locked --git https://github.com/risc0/risc0 bento-client --branch release-2.1 --bin bento_cli
     
     print_info "Running just bento..."
     if command -v just &> /dev/null; then

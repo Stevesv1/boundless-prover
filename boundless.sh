@@ -153,7 +153,7 @@ sudo apt install -y build-essential pkg-config libssl-dev libclang-dev
 print_success "Additional development packages installed"
 
 curl -L https://foundry.paradigm.xyz | bash
-foundry_path="$HOME/.foundry/bin" && grep -q "$foundry_path" <<< "$PATH" || (echo 'export PATH="$HOME/.foundry/bin:$PATH"' >> "$HOME/.profile" && echo 'export PATH="$HOME/.foundry/bin:$PATH"' >> "$HOME/.bashrc" && echo 'export PATH="$HOME/.foundry/bin:$PATH"' >> "$HOME/.zshrc" && export PATH="$HOME/.foundry/bin:$PATH")
+source ~/.bashrc
 foundryup
 
 print_step "Loading Rust environment..."

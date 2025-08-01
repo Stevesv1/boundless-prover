@@ -83,12 +83,6 @@ print_step "Updating system and installing dependencies..."
 sudo apt update && sudo apt install -y sudo git curl
 print_success "Dependencies installed"
 
-print_step "Cloning Boundless repository..."
-git clone https://github.com/boundless-xyz/boundless
-cd boundless
-git checkout release-0.13
-print_success "Repository cloned"
-
 print_step "Replacing setup script..."
 rm scripts/setup.sh
 curl -o scripts/setup.sh https://raw.githubusercontent.com/zunxbt/boundless-prover/refs/heads/main/script.sh
@@ -103,8 +97,8 @@ print_step "Downloading custom configuration files..."
 # fi
 
 # Download custom broker.toml
-curl -o broker.toml https://raw.githubusercontent.com/Stevesv1/boundless/refs/heads/main/broker.toml
-print_success "Downloaded custom broker.toml"
+# curl -o broker.toml https://raw.githubusercontent.com/Stevesv1/boundless/refs/heads/main/broker.toml
+# print_success "Downloaded custom broker.toml"
 
 # Download custom compose.yml
 # curl -o compose.yml https://raw.githubusercontent.com/Stevesv1/boundless/refs/heads/main/compose.yml
